@@ -1,0 +1,586 @@
+---
+title: "Do Higher Temperatures Causally Affect Walmart Weekly Sales?"
+author: "Ashar Hashmi"
+format:
+  pdf:
+    fontsize: 11pt
+    geometry: margin=1in
+    toc: true
+    number-sections: true
+    code-overflow: wrap
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+1.  Introduction
+
+Walmart wants to know whether rising temperatures might hurt or help their 
+weekly sales. With temperatures going up over time, this question matters 
+for planning and forecasting.
+
+I have weekly data from 45 Walmart stores covering February 2010 through 
+October 2012. For each store and week, I observe:
+
+-   Weekly sales
+-   Temperature
+-   Whether it was a holiday week
+-   Fuel price, CPI, and unemployment
+
+Research Question: In these stores, do higher temperatures causally affect
+weekly sales? The main challenge is that both temperature and sales 
+are seasonal. For instance, temperatures are higher in summer, and sales also 
+change across the year because of holidays and shopping patterns. 
+If we simply compare hot weeks to cold weeks, we might mistake seasonality 
+for a temperature effect.
+
+To handle this, I use a panel data approach with:
+
+- Store fixed effects: They control for any permanent differences between 
+stores (like size, location, customer base).
+
+- Date fixed effects: They control for anything that happens in the same week 
+for all stores, such as national holidays, seasonality, or macroeconomic shocks.
+
+- Two‑way clustered standard errors by Store and Date: This is standard in 
+store‑week panel settings.
+
+With store fixed effects and week fixed effects, the model is using changes 
+within the same store over time, after removing anything that is common to all 
+stores in the same week like national shopping patterns, holidays, 
+or seasonal demand. So the temperature effect is identified from week-to-week 
+temperature changes for a given store, not from differences between stores.
+
+```{r}
+
+# 2. Load libraries
+
+library(tidyverse)
+library(lubridate)
+library(fixest)
+library(modelsummary)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+options(scipen = 999)
+set.seed(123)
+
+```
+
+```{r}
+
+# 3. Load the Data
+
+walmart_raw <- readr::read_csv(
+  "data/Walmart_Sales.csv",
+  show_col_types = FALSE
+)
+
+# Show structure 
+str(walmart_raw)
+
+# Show first 6 rows 
+head(walmart_raw)
+
+# Summary statistics 
+summary(walmart_raw)
+
+```
+
+```{r}
+
+# 4. Data Cleaning and Preparation
+
+# 4.1 Fixing the Date column
+# The dataset contains dates written in different 
+# formats (some use dashes, some slashes).
+# To avoid mistakes, I parse dates using multiple possible formats.
+
+walmart <- walmart_raw %>%
+  mutate(
+    Date = parse_date_time(Date, orders = c("dmy", "mdy", "dmY", "mdY"))
+  ) %>%
+  filter(!is.na(Date)) %>%
+  mutate(Date = as_date(Date)) %>%
+  arrange(Store, Date)
+
+# Quick date checks
+range(walmart$Date)
+
+# Check that observations are weekly within store
+walmart %>%
+  group_by(Store) %>%
+  arrange(Date) %>%                
+  summarise(
+    median_gap_days = median(as.numeric(Date - lag(Date)), na.rm = TRUE),
+    pct_gap_7days = mean(as.numeric(Date - lag(Date)) == 7, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  summary()
+
+```
+
+The median gap is 7 days and most gaps are 7 days, so the dates 
+are correctly spaced.
+
+```{r}
+
+# 4.2 Panel structure check
+
+cat("Rows:", nrow(walmart), "\n")
+cat("Stores:", n_distinct(walmart$Store), "\n")
+cat("Weeks:", n_distinct(walmart$Date), "\n")
+
+walmart %>%
+  group_by(Store) %>%
+  summarise(n_weeks = n_distinct(Date), .groups = "drop") %>%
+  summary()
+
+```
+
+All stores appear in most weeks which shows a balanced panel.
+
+```{r}
+
+# 4.3 Log sales
+
+walmart <- walmart %>%
+  mutate(Log_Sales = log(Weekly_Sales))
+
+```
+
+Weekly sales are large and skewed. Taking logs makes the distribution more 
+stable and turns coefficients into approximate percent changes, 
+which is easier to interpret.
+
+```{r}
+
+# 4.4 Note about Holiday_Flag with Date fixed effects
+
+walmart %>%
+  group_by(Date) %>%
+  summarise(n_holiday_values = n_distinct(Holiday_Flag), .groups = "drop") %>%
+  count(n_holiday_values)
+
+```
+
+In this dataset, Holiday_Flag is the same for all stores in the same week.
+
+If we include Date fixed effects, Holiday_Flag is perfectly collinear 
+(absorbed by the date dummies). We can quickly verify that.
+
+Because every date has only one holiday value, I do not include Holiday_Flag 
+separately in models that have Date FE.
+
+```{r}
+
+# 5. Summary Statistics
+
+walmart %>%
+  summarise(
+    mean_sales = mean(Weekly_Sales, na.rm = TRUE),
+    sd_sales   = sd(Weekly_Sales, na.rm = TRUE),
+    mean_temp  = mean(Temperature, na.rm = TRUE),
+    sd_temp    = sd(Temperature, na.rm = TRUE),
+    mean_fuel  = mean(Fuel_Price, na.rm = TRUE),
+    mean_cpi   = mean(CPI, na.rm = TRUE),
+    mean_unemp = mean(Unemployment, na.rm = TRUE)
+  )
+
+```
+
+
+```{r}
+
+# 6. Exploratory Graphs – Guiding the Model
+# These graphs help us see why strong time controls are needed.
+
+# 6.1 Temperature over time
+
+ggplot(walmart, aes(x = Date, y = Temperature, group = Store)) +
+  geom_line(alpha = 0.10, color = "steelblue") +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "darkred") +
+  labs(
+    title = "Temperature Over Time (All Stores)",
+    subtitle = "Temperature has a clear seasonal pattern.",
+    x = "Week",
+    y = "Temperature (°F)"
+  ) +
+  theme_minimal()
+
+```
+
+Temperature peaks in summer and lowers in winter, it shows a strong seasonal cycle.
+
+```{r}
+
+# 6.2 Sales over time
+
+ggplot(walmart, aes(x = Date, y = Weekly_Sales, group = Store)) +
+  geom_line(alpha = 0.10, color = "darkgreen") +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "darkred") +
+  labs(
+    title = "Weekly Sales Over Time (All Stores)",
+    subtitle = "Sales also vary across the year, with holiday spikes.",
+    x = "Week",
+    y = "Weekly Sales"
+  ) +
+  scale_y_continuous(labels = dollar) +
+  theme_minimal()
+
+```
+
+Sales also have seasonal patterns and big holiday bumps.
+If we want the pure temperature effect, we must control for these common 
+time patterns, which is exactly what date fixed effects do.
+
+```{r}
+
+# 6.3 Raw relationship between sales and temperature
+
+ggplot(walmart, aes(x = Temperature, y = Weekly_Sales)) +
+  geom_point(alpha = 0.05, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred") +
+  labs(
+    title = "Raw Sales vs. Temperature",
+    subtitle = "Without controls, sales look higher when it's warmer,
+    but that could be seasonality.",
+    x = "Temperature (°F)",
+    y = "Weekly Sales"
+  ) +
+  scale_y_continuous(labels = dollar) +
+  theme_minimal()
+
+```
+
+The raw plot suggests higher sales in warmer weeks.
+But we already know both variables move with seasons so this is likely spurious.
+The scatter also looks slightly curved, so I later test a quadratic
+specification to see whether the relationship departs from linearity 
+once fixed effects are included.
+
+7. Thinking About Causal Identification
+To answer “causally”, we need to imagine comparing two weeks in the same 
+store that are identical in every way except temperature.
+Store fixed effects remove all time‑invariant store differences.
+Date fixed effects remove all national‑level shocks and seasonality.
+
+What’s Left:
+The remaining variation comes from weeks where one store happened to be 
+warmer or colder than the average for that week across all stores.
+That variation is plausibly more “as if random” after 
+we condition on the controls.
+
+But what about the other controls (Fuel_Price, CPI, Unemployment)?
+These variables could be:
+
+Confounders: Things that affect both temperature and 
+sales (e.g., economic conditions might be correlated with weather patterns).
+
+Mediators: Things that temperature affects, which then affect sales 
+(e.g., higher temperatures could increase fuel demand and raise fuel prices).
+
+If they are mediators, controlling for them would bias the temperature 
+coefficient (because we would be blocking part of the causal path).
+If they are confounders, we should control for them.
+
+In practice, it’s hard to know for sure.
+I will include them in the main model because they capture some local 
+economic variation that is not already absorbed by 
+date fixed effects (date FE only removes national trends).
+Later, as a robustness check, I will run the model without them to see 
+if the temperature estimate changes.
+
+One detail is important here, because the model includes Date fixed effects, 
+any purely national movement in fuel prices, CPI, or unemployment is already 
+absorbed by the week dummies. These controls only matter through differences 
+across stores within the same week, which helps account for local economic 
+conditions that could be correlated with local weather shocks.
+
+
+Causal story (Informal DAG):
+
+Temperature → May affect sales directly 
+(people might shop less when very hot or cold).
+
+Temperature → May affect fuel prices 
+(demand for energy) which could affect sales.
+
+Temperature → May affect unemployment (e.g., seasonal jobs) 
+which could affect sales.
+
+Seasonality → Affects both temperature and sales. (Date FE removes this.)
+
+Local economic conditions → Could affect sales and might be correlated 
+with temperature e.g., a heat wave might coincide with a local economic boom. 
+Fuel, CPI, Unemployment help control for this.
+
+So the main model will include Fuel_Price, CPI, Unemployment, 
+plus store and date fixed effects.
+
+```{r}
+
+# 8. Main Fixed Effects Model
+
+m_main <- feols(
+  Log_Sales ~ Temperature + Fuel_Price + CPI + Unemployment | Store + Date,
+  data = walmart,
+  cluster = ~ Store + Date
+)
+
+```
+
+
+```{r}
+
+# 9. Checking for Non‑linearity
+
+walmart <- walmart %>%
+  mutate(Temp_sq = Temperature^2)
+
+m_quad <- feols(
+  Log_Sales ~ Temperature + Temp_sq + Fuel_Price + CPI + 
+    Unemployment | Store + Date, data = walmart,
+  cluster = ~ Store + Date
+)
+
+```
+
+To check whether the temperature effect is nonlinear, I added a 
+quadratic term (Temperature²). In my results, the quadratic term is 
+statistically significant, which suggests the relationship is not 
+perfectly linear. That said, the quadratic coefficient is extremely small, 
+so the curvature is mild in practice. We can say that sales change 
+with temperature, but the shape of that relationship does not bend sharply 
+across the temperature range in this dataset. 
+So I treat the quadratic term as evidence of a small nonlinear pattern, 
+but the overall temperature effect is still modest.
+
+The quadratic coefficient appears as 0.000 in the table due to rounding however, 
+it is small in magnitude but statistically significant.
+
+```{r}
+
+# 10. Check for Lagged Effects
+
+walmart <- walmart %>%
+  group_by(Store) %>%
+  arrange(Date) %>%
+  mutate(
+    Temp_lag1 = lag(Temperature, 1)
+  ) %>%
+  ungroup()
+
+m_lag <- feols(
+  Log_Sales ~ Temperature + Temp_lag1 + Fuel_Price + CPI + 
+  Unemployment | Store + Date, data = walmart,
+  cluster = ~ Store + Date
+)
+
+summary(m_lag)
+
+```
+I also tested whether temperature affects sales with a delay by adding 
+last week’s temperature to the model. The lagged temperature coefficient is 
+statistically significant at the 1% level. This suggests that temperature may 
+have a small carryover effect into the following week. 
+The magnitude of the coefficient is about 0.00157 which implies that a 
+one-degree increase in temperature last week is associated with roughly a 0.157% 
+increase in sales this week, holding store and week fixed effects constant.
+
+Even though the effect is statistically significant, it remains economically 
+small. Overall, the results suggest that temperature influences sales mainly in 
+the current week, with a modest additional impact from the previous week.
+
+```{r}
+
+# 11. Robustness Checks
+# 11.1 Without economic controls
+# If fuel price, CPI, and unemployment are mediators, we should see the 
+# temperature coefficient change when we drop them.
+
+m_no_controls <- feols(
+  Log_Sales ~ Temperature | Store + Date,
+  data = walmart,
+  cluster = ~ Store + Date
+)
+
+```
+
+
+```{r}
+
+# 11.2 Adding store‑specific time trends
+# Sometimes stores have their own trends 
+# (e.g., a store growing faster than others).
+# I add store‑specific linear time trends to see if that changes the result.
+
+walmart <- walmart %>%
+  group_by(Store) %>%
+  mutate(week_id = as.numeric(Date - min(Date)) / 7) %>%   
+  ungroup()
+
+m_trend <- feols(
+  Log_Sales ~ Temperature + Fuel_Price + CPI + Unemployment | Store[week_id] + 
+  Date, data = walmart, cluster = ~ Store + Date
+)
+
+```
+
+
+```{r}
+
+# 12. Results Tables
+
+models_1 <- list(
+  "Main" = m_main,
+  "No controls" = m_no_controls,
+  "Quadratic" = m_quad
+)
+
+models_2 <- list(
+  "With lag" = m_lag,
+  "Store trends" = m_trend
+)
+
+common_args <- list(
+  stars = c("*" = .1, "**" = .05, "***" = .01),
+  coef_map = c(
+    "Temperature" = "Temperature",
+    "Temp_sq" = "Temperature²",
+    "Temp_lag1" = "Temperature (1-week lag)"
+  ),
+  gof_map = c("nobs", "r.squared", "vcov.type"),
+  notes = paste(
+    "All models include Store and Date fixed effects, except where noted.",
+    "Standard errors clustered by Store and Date."
+  )
+)
+
+do.call(modelsummary, c(list(
+  models_1,
+  title = "Regression Results (1/2): Main, No Controls, Quadratic"
+), common_args))
+
+do.call(modelsummary, c(list(
+  models_2,
+  title = "Regression Results (2/2): With Lag and Store Trends"
+), common_args))
+
+
+```
+
+
+```{r}
+
+# 13. Interpreting the Results
+
+b_temp <- coef(m_main)["Temperature"]
+pct_change <- 100 * (exp(b_temp) - 1)
+
+ci <- confint(m_main, parm = "Temperature")
+ci_pct <- 100 * (exp(ci) - 1)
+
+cat("Temperature coefficient (log points): ", round(b_temp, 6), "\n", sep = "")
+cat("Approx. percent change in sales per +1°F: ", 
+    round(pct_change, 3), "%\n", sep = "")
+cat("95% CI in percent terms: [", round(ci_pct[[1]], 3), "%, ", 
+    round(ci_pct[[2]], 3), "%]\n", sep = "")
+
+```
+
+In the log model, the temperature coefficient translates into about 
+a 0.199% increase in weekly sales for a 1°F increase in temperature, 
+holding the other controls and fixed effects constant. 
+The 95% confidence interval is roughly 0.076% to 0.323%, so the estimate is 
+positive and fairly precise statistically. 
+Even so, the effect size is small in business terms: a one-degree change in 
+temperature is not expected to meaningfully change sales on its own.
+
+Now we look at the other models.
+
+No controls gives a slightly larger coefficient (about 0.0020). 
+This suggests that adding Fuel_Price, CPI, and Unemployment explains a 
+small part of the variation, but the temperature effect remains very similar.
+
+Quadratic: The squared term is extremely small, and it does not change 
+the main conclusion. Any non linearity appears mild in practical terms.
+
+With lag: The lagged temperature coefficient is statistically significant, 
+which suggests a small carryover effect into the next week. 
+However, the magnitude is still modest, so the economic impact remains small.
+
+Store trends: The coefficient barely changes (around 0.0016), which suggests
+store-specific trends are not driving the result.
+
+Overall, the temperature estimate is stable across specifications, and the 
+main conclusion stays the same: the effect is positive but small.
+
+```{r}
+
+# 14. Visual Check of the Residual Relationship
+# This plot shows the relationship that the fixed‑effects model actually uses, 
+# after removing store effects, date effects, and controls from both variables.
+
+resid_sales <- resid(feols(Log_Sales ~ Fuel_Price + CPI + 
+                             Unemployment | Store + Date, data = walmart))
+resid_temp  <- resid(feols(Temperature ~ Fuel_Price + CPI + 
+                             Unemployment | Store + Date, data = walmart))
+
+plot_df <- tibble(resid_sales = resid_sales, resid_temp = resid_temp)
+
+ggplot(plot_df, aes(x = resid_temp, y = resid_sales)) +
+  geom_point(alpha = 0.10, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred") +
+  labs(
+    title = "Residualized Relationship (Matches the FE Model)",
+    subtitle = "After removing Store FE, Date FE, and economic controls",
+    x = "Temperature residual (°F)",
+    y = "Log sales residual"
+  ) +
+  theme_minimal()
+
+```
+
+The line is slightly upward but very shallow, consistent with 
+a small positive effect.
+
+15. Answer to the Research Question
+Do higher temperatures causally affect Walmart weekly sales?
+
+Based on the fixed‑effects models:
+
+The estimated effect is positive but very small, about a 0.20% increase 
+in sales per 1°F (roughly 0.199% in the main model).
+
+This result is robust to dropping controls, adding a quadratic term, 
+including a lag and adding store‑specific trends.
+
+The effect is economically small compared to normal seasonal 
+swings or holiday weeks.
+
+So while temperature does have a statistically detectable effect, it is not 
+large enough to be a major concern for Walmart’s overall sales forecasting.
+
+16. Limitations
+Even with store and date fixed effects, we cannot completely rule out 
+local,time‑varying confounders. For example, a local festival or a severe 
+storm could affect both temperature perceptions and shopping behavior, and 
+those events might not be fully captured by date fixed effects, 
+because they hit only one store.
+That kind of bias would be small and unlikely to overturn the conclusion, 
+but it’s worth mentioning.
+
+Also, the data covers only 45 stores over about 2.5 years, results might 
+differ in other regions or longer periods.
+
+17. Executive Summary
+Sales and temperature both follow seasonal patterns, so a simple comparison 
+is misleading. After using store and week fixed effects to control for those 
+patterns, I find that a 1°F warmer week is associated with only about 
+a 0.20% increase in sales (about 0.199% in the main model).
+That’s a tiny effect, much smaller than the usual holiday bumps.
+Walmart probably does not need to worry about gradual temperature 
+changes when planning weekly sales.
